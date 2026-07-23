@@ -4508,7 +4508,7 @@ let c = 3;"#
             .unwrap();
     }
 
-    #[gpui::test]
+    #[gpui::test(seeds(0, 1))]
     async fn test_refresh_requested_multi_server(cx: &mut gpui::TestAppContext) {
         // Bug 2: When one LSP server sends workspace/inlayHint/refresh, the editor
         // wipes all tracking state via clear(), then spawns tasks that call
@@ -4646,7 +4646,8 @@ let c = 3;"#
         cx.executor().advance_clock(Duration::from_millis(100));
         cx.executor().run_until_parked();
 
-        // Verify both servers' hints are present initially.
+        // The seeds exercise both server registration orderings. A chunk fetched before
+        // the second server registers must still be queried for that server.
         editor
             .update(cx, |editor, _window, cx| {
                 let visible = visible_hint_labels(editor, cx);

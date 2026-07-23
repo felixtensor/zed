@@ -19,6 +19,8 @@ use crate::{
     project_settings::ProjectSettings,
 };
 
+use super::RunningFetch;
+
 pub type CacheInlayHints = HashMap<LanguageServerId, Vec<(InlayId, InlayHint)>>;
 pub type CacheInlayHintsTask = Shared<Task<Result<CacheInlayHints, Arc<anyhow::Error>>>>;
 
@@ -54,11 +56,11 @@ impl InvalidationStrategy {
 pub struct BufferInlayHints {
     chunks: RowChunks,
     hints_by_chunks: Vec<Option<CacheInlayHints>>,
-    fetches_by_chunks: Vec<Option<CacheInlayHintsTask>>,
+    fetched_servers_by_chunks: Vec<HashSet<LanguageServerId>>,
+    fetches_by_chunks: Vec<Option<RunningFetch<CacheInlayHintsTask>>>,
     hints_by_id: HashMap<InlayId, HintForId>,
     pending_refreshes: HashSet<LanguageServerId>,
     work_end_refreshes: HashSet<LanguageServerId>,
-    pub(super) fetched_servers: HashSet<LanguageServerId>,
     pub(super) hint_resolves: HashMap<InlayId, Shared<Task<()>>>,
 }
 
@@ -74,6 +76,7 @@ impl std::fmt::Debug for BufferInlayHints {
         f.debug_struct("BufferInlayHints")
             .field("buffer_chunks", &self.chunks)
             .field("hints_by_chunks", &self.hints_by_chunks)
+            .field("fetched_servers_by_chunks", &self.fetched_servers_by_chunks)
             .field("fetches_by_chunks", &self.fetches_by_chunks)
             .field("hints_by_id", &self.hints_by_id)
             .finish_non_exhaustive()
@@ -88,10 +91,10 @@ impl BufferInlayHints {
 
         Self {
             hints_by_chunks: vec![None; chunks.len()],
-            fetches_by_chunks: vec![None; chunks.len()],
+            fetched_servers_by_chunks: vec![HashSet::default(); chunks.len()],
+            fetches_by_chunks: std::iter::repeat_with(|| None).take(chunks.len()).collect(),
             pending_refreshes: HashSet::default(),
             work_end_refreshes: HashSet::default(),
-            fetched_servers: HashSet::default(),
             hints_by_id: HashMap::default(),
             hint_resolves: HashMap::default(),
             chunks,
@@ -106,8 +109,19 @@ impl BufferInlayHints {
         self.hints_by_chunks[chunk.id].as_ref()
     }
 
-    pub fn fetched_hints(&mut self, chunk: &RowChunk) -> &mut Option<CacheInlayHintsTask> {
-        &mut self.fetches_by_chunks[chunk.id]
+    pub(super) fn chunk_data(
+        &mut self,
+        chunk: &RowChunk,
+    ) -> (
+        &mut CacheInlayHints,
+        &mut HashSet<LanguageServerId>,
+        &mut Option<RunningFetch<CacheInlayHintsTask>>,
+    ) {
+        (
+            self.hints_by_chunks[chunk.id].get_or_insert_default(),
+            &mut self.fetched_servers_by_chunks[chunk.id],
+            &mut self.fetches_by_chunks[chunk.id],
+        )
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -125,21 +139,24 @@ impl BufferInlayHints {
     pub fn all_fetched_hints(&self) -> Vec<CacheInlayHintsTask> {
         self.fetches_by_chunks
             .iter()
-            .filter_map(|fetches| fetches.clone())
+            .filter_map(|fetch| fetch.as_ref().map(|fetch| fetch.task.clone()))
             .collect()
     }
 
     pub fn remove_server_data(&mut self, for_server: LanguageServerId) {
         for (chunk_index, hints) in self.hints_by_chunks.iter_mut().enumerate() {
-            if let Some(hints) = hints {
-                if hints.remove(&for_server).is_some() {
-                    self.fetches_by_chunks[chunk_index] = None;
+            if let Some(removed_hints) = hints.as_mut().and_then(|hints| hints.remove(&for_server))
+            {
+                for (id, _) in removed_hints {
+                    self.hints_by_id.remove(&id);
+                    self.hint_resolves.remove(&id);
                 }
             }
+            self.fetched_servers_by_chunks[chunk_index].remove(&for_server);
+            RunningFetch::discard_if_queried(&mut self.fetches_by_chunks[chunk_index], for_server);
         }
         self.pending_refreshes.remove(&for_server);
         self.work_end_refreshes.remove(&for_server);
-        self.fetched_servers.remove(&for_server);
     }
 
     fn mark_refresh_pending(&mut self, server_id: LanguageServerId) {
@@ -163,15 +180,17 @@ impl BufferInlayHints {
 
     pub fn clear(&mut self) {
         self.hints_by_chunks = vec![None; self.chunks.len()];
-        self.fetches_by_chunks = vec![None; self.chunks.len()];
+        self.fetched_servers_by_chunks = vec![HashSet::default(); self.chunks.len()];
+        self.fetches_by_chunks = std::iter::repeat_with(|| None)
+            .take(self.chunks.len())
+            .collect();
         self.hints_by_id.clear();
         self.hint_resolves.clear();
         self.pending_refreshes.clear();
         self.work_end_refreshes.clear();
-        self.fetched_servers.clear();
     }
 
-    pub fn insert_new_hints(
+    pub fn replace_server_hints(
         &mut self,
         chunk: RowChunk,
         server_id: LanguageServerId,
@@ -199,7 +218,6 @@ impl BufferInlayHints {
             }
         }
         chunk_hints.insert(server_id, inserted_hints);
-        *self.fetched_hints(&chunk) = None;
     }
 
     pub fn hint_for_id(&mut self, id: InlayId) -> Option<&mut InlayHint> {
@@ -231,22 +249,12 @@ impl BufferInlayHints {
                     self.hints_by_id.remove(&id);
                     self.hint_resolves.remove(&id);
                 }
-                self.fetches_by_chunks[chunk_id] = None;
             }
+            self.fetched_servers_by_chunks[chunk_id].remove(&for_server);
+            RunningFetch::discard_if_queried(&mut self.fetches_by_chunks[chunk_id], for_server);
         }
-        self.fetched_servers.remove(&for_server);
 
         true
-    }
-
-    pub(crate) fn invalidate_for_chunk(&mut self, chunk: RowChunk) {
-        self.fetches_by_chunks[chunk.id] = None;
-        if let Some(hints_by_server) = self.hints_by_chunks[chunk.id].take() {
-            for (hint_id, _) in hints_by_server.into_values().flatten() {
-                self.hints_by_id.remove(&hint_id);
-                self.hint_resolves.remove(&hint_id);
-            }
-        }
     }
 }
 

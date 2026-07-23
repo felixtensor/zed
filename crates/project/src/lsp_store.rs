@@ -4171,11 +4171,6 @@ impl<T> RunningFetch<T> {
     }
 }
 
-enum ChunkFetch {
-    Cached(CacheInlayHints),
-    Running(CacheInlayHintsTask),
-}
-
 fn notify_server_capabilities_updated(server: &LanguageServer, cx: &mut Context<LspStore>) {
     if let Some(capabilities) = serde_json::to_string(&server.capabilities()).ok() {
         cx.emit(LspStoreEvent::LanguageServerUpdate {
@@ -7708,6 +7703,7 @@ impl LspStore {
         known_chunks: Option<(clock::Global, HashSet<Range<BufferRow>>)>,
         cx: &mut Context<Self>,
     ) -> HashMap<Range<BufferRow>, Task<Result<CacheInlayHints>>> {
+        let buffer_id = buffer.read(cx).remote_id();
         let next_hint_id = self.next_hint_id.clone();
         let current_servers = self.relevant_server_ids_for_capability_check(&buffer, cx);
         let lsp_data = self.latest_lsp_data(&buffer, cx);
@@ -7718,13 +7714,6 @@ impl LspStore {
                 .invalidate_for_server_refresh(server_id);
         }
         let existing_inlay_hints = &mut lsp_data.inlay_hints;
-        existing_inlay_hints
-            .fetched_servers
-            .retain(|server_id| current_servers.contains(server_id));
-        let missing_servers = current_servers
-            .difference(&existing_inlay_hints.fetched_servers)
-            .copied()
-            .collect::<HashSet<_>>();
         let known_chunks = known_chunks
             .filter(|(known_version, _)| !query_version.changed_since(known_version))
             .map(|(_, known_chunks)| known_chunks)
@@ -7744,130 +7733,149 @@ impl LspStore {
             return HashMap::default();
         }
 
-        let mut chunk_hint_tasks = HashMap::default();
+        let mut result = HashMap::default();
         for chunk in applicable_chunks {
-            let cached_hints = existing_inlay_hints.cached_hints(&chunk).cloned();
-            let running_fetch = existing_inlay_hints.fetched_hints(&chunk).clone();
-            let servers_to_query = if cached_hints.is_none() && running_fetch.is_none() {
-                Some(None)
-            } else if missing_servers.is_empty() {
-                None
-            } else {
-                Some(Some(missing_servers.clone()))
-            };
-
-            let Some(servers_to_query) = servers_to_query else {
-                match running_fetch {
-                    Some(running_fetch) => chunk_hint_tasks
-                        .insert(chunk.row_range(), ChunkFetch::Running(running_fetch)),
-                    None => chunk_hint_tasks.insert(
-                        chunk.row_range(),
-                        ChunkFetch::Cached(cached_hints.unwrap_or_default()),
-                    ),
+            let servers_to_query = {
+                let (cached_hints, fetched_servers, running_fetch) =
+                    existing_inlay_hints.chunk_data(&chunk);
+                let Some(missing_servers) =
+                    missing_servers_to_query(cached_hints, fetched_servers, &current_servers)
+                else {
+                    result.insert(chunk.row_range(), Task::ready(Ok(cached_hints.clone())));
+                    continue;
                 };
-                continue;
-            };
-
-            existing_inlay_hints
-                .fetched_servers
-                .extend(servers_to_query.iter().flatten().copied());
-            if servers_to_query.is_none() {
-                existing_inlay_hints
-                    .fetched_servers
-                    .extend(current_servers.iter().copied());
-            }
-            let queried_servers = match &servers_to_query {
-                Some(servers) => servers.clone(),
-                None => current_servers.clone(),
-            };
-
-            let next_hint_id = next_hint_id.clone();
-            let buffer = buffer.clone();
-            let query_version = query_version.clone();
-            let range_to_query = chunk.anchor_range();
-            let new_inlay_hints = cx
-                .spawn(async move |lsp_store, cx| {
-                    // Let the previous fetch merge its hints into the cache first, so
-                    // that the chunk state read below contains its servers' hints too.
-                    if let Some(running_fetch) = running_fetch {
-                        running_fetch.await.ok();
-                    }
-                    let new_fetch_task = lsp_store.update(cx, |lsp_store, cx| {
-                        lsp_store.fetch_inlay_hints(servers_to_query, &buffer, range_to_query, cx)
-                    })?;
-                    match new_fetch_task.await {
-                        Ok(new_hints_by_server) => lsp_store
-                            .update(cx, |lsp_store, cx| {
-                                let lsp_data = lsp_store.latest_lsp_data(&buffer, cx);
-                                if lsp_data.buffer_version == query_version {
-                                    if new_hints_by_server.is_empty() {
-                                        lsp_data.inlay_hints.invalidate_for_chunk(chunk);
-                                    } else {
-                                        for (server_id, new_hints) in new_hints_by_server {
-                                            let new_hints = new_hints
-                                                .into_iter()
-                                                .map(|new_hint| {
-                                                    (
-                                                        InlayId::Hint(next_hint_id.fetch_add(
-                                                            1,
-                                                            atomic::Ordering::AcqRel,
-                                                        )),
-                                                        new_hint,
-                                                    )
-                                                })
-                                                .collect::<Vec<_>>();
-                                            lsp_data
-                                                .inlay_hints
-                                                .insert_new_hints(chunk, server_id, new_hints);
-                                        }
-                                    }
+                if let Some(running_fetch) = running_fetch
+                    && !query_version.changed_since(&running_fetch.version)
+                    && missing_servers.is_subset(&running_fetch.servers)
+                {
+                    let running_task = running_fetch.task.clone();
+                    result.insert(
+                        chunk.row_range(),
+                        cx.spawn(async move |_, _| {
+                            running_task.await.map_err(|error| {
+                                if error.error_code() != ErrorCode::Internal {
+                                    anyhow!(error.error_code())
+                                } else {
+                                    anyhow!("{error:#}")
                                 }
-                                lsp_data
-                                    .inlay_hints
-                                    .cached_hints(&chunk)
-                                    .cloned()
-                                    .unwrap_or_default()
                             })
-                            .map_err(Arc::new),
-                        Err(e) => {
-                            lsp_store
-                                .update(cx, |lsp_store, cx| {
-                                    let lsp_data = lsp_store.latest_lsp_data(&buffer, cx);
-                                    if lsp_data.buffer_version == query_version {
-                                        for server_id in &queried_servers {
-                                            lsp_data.inlay_hints.fetched_servers.remove(server_id);
+                        }),
+                    );
+                    continue;
+                }
+
+                missing_servers
+            };
+
+            let fetch_id = next_lsp_fetch_id();
+            let range_to_query = chunk.anchor_range();
+            let queried_servers = servers_to_query.clone();
+            let task_buffer = buffer.clone();
+            let task_query_version = query_version.clone();
+            let task_next_hint_id = next_hint_id.clone();
+            let new_inlay_hints = cx
+                .spawn({
+                    let queried_servers = queried_servers.clone();
+                    async move |lsp_store, cx| {
+                        let fetched_hints = lsp_store
+                            .update(cx, |lsp_store, cx| {
+                                lsp_store.fetch_inlay_hints(
+                                    Some(servers_to_query),
+                                    &task_buffer,
+                                    range_to_query,
+                                    cx,
+                                )
+                            })
+                            .map_err(Arc::new)?
+                            .await
+                            .map_err(Arc::new);
+
+                        let fetched_hints = match fetched_hints {
+                            Ok(fetched_hints) => fetched_hints,
+                            Err(error) => {
+                                lsp_store
+                                    .update(cx, |lsp_store, _| {
+                                        if let Some(lsp_data) =
+                                            lsp_store.lsp_data.get_mut(&buffer_id)
+                                        {
+                                            let (_, _, running_fetch) =
+                                                lsp_data.inlay_hints.chunk_data(&chunk);
+                                            RunningFetch::take_finished(running_fetch, fetch_id);
                                         }
+                                    })
+                                    .ok();
+                                return Err(error);
+                            }
+                        };
+
+                        lsp_store
+                            .update(cx, |lsp_store, cx| {
+                                let lsp_data = lsp_store.latest_lsp_data(&task_buffer, cx);
+                                let update_cache = lsp_data.buffer_version == task_query_version;
+                                let fetch_is_current = {
+                                    let (_, _, running_fetch) =
+                                        lsp_data.inlay_hints.chunk_data(&chunk);
+                                    RunningFetch::take_finished(running_fetch, fetch_id)
+                                };
+                                if !fetch_is_current || !update_cache {
+                                    return lsp_data
+                                        .inlay_hints
+                                        .cached_hints(&chunk)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                }
+
+                                for (server_id, new_hints) in fetched_hints {
+                                    if !queried_servers.contains(&server_id) {
+                                        continue;
                                     }
-                                })
-                                .ok();
-                            Err(Arc::new(e))
-                        }
+                                    let new_hints = new_hints
+                                        .into_iter()
+                                        .map(|new_hint| {
+                                            (
+                                                InlayId::Hint(
+                                                    task_next_hint_id
+                                                        .fetch_add(1, atomic::Ordering::AcqRel),
+                                                ),
+                                                new_hint,
+                                            )
+                                        })
+                                        .collect();
+                                    lsp_data
+                                        .inlay_hints
+                                        .replace_server_hints(chunk, server_id, new_hints);
+                                }
+                                let (cached_hints, fetched_servers, _) =
+                                    lsp_data.inlay_hints.chunk_data(&chunk);
+                                fetched_servers.extend(queried_servers);
+                                cached_hints.clone()
+                            })
+                            .map_err(Arc::new)
                     }
                 })
                 .shared();
 
-            *existing_inlay_hints.fetched_hints(&chunk) = Some(new_inlay_hints.clone());
-            chunk_hint_tasks.insert(chunk.row_range(), ChunkFetch::Running(new_inlay_hints));
+            let (_, _, running_fetch) = existing_inlay_hints.chunk_data(&chunk);
+            *running_fetch = Some(RunningFetch {
+                id: fetch_id,
+                version: query_version.clone(),
+                servers: queried_servers,
+                task: new_inlay_hints.clone(),
+            });
+            result.insert(
+                chunk.row_range(),
+                cx.spawn(async move |_, _| {
+                    new_inlay_hints.await.map_err(|error| {
+                        if error.error_code() != ErrorCode::Internal {
+                            anyhow!(error.error_code())
+                        } else {
+                            anyhow!("{error:#}")
+                        }
+                    })
+                }),
+            );
         }
-
-        chunk_hint_tasks
-            .into_iter()
-            .map(|(row_range, chunk_fetch)| {
-                let task = match chunk_fetch {
-                    ChunkFetch::Cached(hints) => Task::ready(Ok(hints)),
-                    ChunkFetch::Running(hints_fetch) => cx.spawn(async move |_, _| {
-                        hints_fetch.await.map_err(|e| {
-                            if e.error_code() != ErrorCode::Internal {
-                                anyhow!(e.error_code())
-                            } else {
-                                anyhow!("{e:#}")
-                            }
-                        })
-                    }),
-                };
-                (row_range, task)
-            })
-            .collect()
+        result
     }
 
     fn fetch_inlay_hints(
