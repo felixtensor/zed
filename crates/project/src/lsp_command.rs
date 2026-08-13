@@ -2954,7 +2954,16 @@ impl LspCommand for GetCodeActions {
             .snapshot()
             .diagnostics_in_range::<_, language::PointUtf16>(self.range.clone(), false)
         {
-            relevant_diagnostics.push(entry.to_lsp_diagnostic_stub()?);
+            let mut diagnostic = entry.to_lsp_diagnostic_stub()?;
+            // Servers that key their quickfixes off related information need it back the
+            // way they sent it, so pass through what was stored during ingestion instead
+            // of reassembling it from the entries Zed flattened it into.
+            diagnostic.related_information = entry
+                .diagnostic
+                .related_information
+                .as_ref()
+                .map(|related_information| related_information.to_vec());
+            relevant_diagnostics.push(diagnostic);
         }
 
         let only = if let Some(requested) = &self.kinds {

@@ -473,6 +473,9 @@ pub fn deserialize_diagnostics(
                         proto::diagnostic::SourceKind::Other => DiagnosticSourceKind::Other,
                     },
                     data,
+                    // Only the peer that talks to the language server builds LSP requests
+                    // out of these diagnostics, and it always has the original.
+                    related_information: None,
                 },
             })
         })

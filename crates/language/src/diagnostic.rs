@@ -1,7 +1,8 @@
 use gpui::SharedString;
-use lsp::{DiagnosticSeverity, NumberOrString};
+use lsp::{DiagnosticRelatedInformation, DiagnosticSeverity, NumberOrString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// A diagnostic associated with a certain range of a buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +46,19 @@ pub struct Diagnostic {
     pub data: Option<Value>,
     /// Whether to underline the corresponding text range in the editor.
     pub underline: bool,
+    /// The related information as the language server sent it, set on primary
+    /// diagnostics only. Zed also flattens it into non-primary entries of the same
+    /// group for rendering, but that representation is lossy (messages are trimmed,
+    /// entries pointing at other files are dropped), so the original is kept and,
+    /// like `data`, passed back to the LS when we request code actions.
+    ///
+    /// Its ranges are the ones the server published rather than anchors, so they do
+    /// not follow edits made after the diagnostic arrived; a server resolves them
+    /// against the document version it published them for.
+    ///
+    /// The proto conversion does not carry this field: LSP requests are only built by
+    /// the peer that received the diagnostics from the language server.
+    pub related_information: Option<Arc<[DiagnosticRelatedInformation]>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +85,7 @@ impl Default for Diagnostic {
             underline: true,
             data: None,
             registration_id: None,
+            related_information: None,
         }
     }
 }

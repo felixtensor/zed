@@ -12202,6 +12202,10 @@ impl LspStore {
                         underline,
                         data: diagnostic.data.clone(),
                         registration_id: registration_id.clone(),
+                        related_information: diagnostic
+                            .related_information
+                            .as_ref()
+                            .map(|infos| Arc::from(infos.as_slice())),
                     },
                 });
                 if let Some(infos) = &diagnostic.related_information {
@@ -12230,6 +12234,7 @@ impl LspStore {
                                     underline,
                                     data: diagnostic.data.clone(),
                                     registration_id: registration_id.clone(),
+                                    related_information: None,
                                 },
                             });
                         }
