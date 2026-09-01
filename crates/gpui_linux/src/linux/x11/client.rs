@@ -65,7 +65,7 @@ use gpui::{
     PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
     TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
-use gpui_wgpu::{CompositorGpuHint, GpuContext};
+use gpui_wgpu::{CompositorGpuHint, GpuContext, wgpu};
 
 /// Value for DeviceId parameters which selects all devices.
 pub(crate) const XINPUT_ALL_DEVICES: xinput::DeviceId = 0;
@@ -180,6 +180,7 @@ pub struct X11ClientState {
 
     pub(crate) gpu_context: GpuContext,
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
+    pub(crate) gpu_backends: wgpu::Backends,
 
     pub(crate) scale_factor: f32,
 
@@ -362,9 +363,11 @@ impl X11Client {
             || "XInput XiQueryVersion failed",
             xcb_connection.xinput_xi_query_version(2, 4),
         )?;
-        assert!(
+        anyhow::ensure!(
             xinput_version.major_version >= 2,
-            "XInput version >= 2 required."
+            "X11 server reports XInput {}.{}, but XInput 2 or newer is required.",
+            xinput_version.major_version,
+            xinput_version.minor_version,
         );
         let supports_xinput_gestures = xinput_version.major_version > 2
             || (xinput_version.major_version == 2 && xinput_version.minor_version >= 4);
@@ -455,6 +458,7 @@ impl X11Client {
 
         let screen = &xcb_connection.setup().roots[x_root_index];
         let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
+        let gpu_backends = supported_gpu_backends(&xcb_connection);
 
         let xcb_connection = Rc::new(xcb_connection);
 
@@ -527,6 +531,7 @@ impl X11Client {
             pinch_scale: 1.0,
             gpu_context: Rc::new(RefCell::new(None)),
             compositor_gpu,
+            gpu_backends,
             scale_factor,
 
             xkb_context,
@@ -638,7 +643,14 @@ impl X11Client {
                     Ok(None) => {
                         break;
                     }
-                    Err(err @ ConnectionError::IoError(..)) => {
+                    // libxcb latches `UnsupportedExtension` when it shuts the
+                    // connection down after a request naming an extension the
+                    // server does not implement. That state never clears, so
+                    // treating it as recoverable spins this loop forever.
+                    Err(
+                        err
+                        @ (ConnectionError::IoError(..) | ConnectionError::UnsupportedExtension),
+                    ) => {
                         return Err(EventHandlerError::from(err));
                     }
                     Err(err) => {
@@ -1646,6 +1658,7 @@ impl LinuxClient for X11Client {
             parent_window,
             supports_xinput_gestures,
             is_bgr,
+            state.gpu_backends,
         )?;
         check_reply(
             || "Failed to set XdndAware property",
@@ -2165,6 +2178,45 @@ pub fn mode_refresh_rate(mode: &randr::ModeInfo) -> Duration {
 
 fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
     value.integral as f32 + value.frac as f32 / u32::MAX as f32
+}
+
+/// The X11 `Present` extension name. gpui does not enable x11rb's `present`
+/// feature, so the name is spelled out rather than taken from that module.
+const PRESENT_EXTENSION_NAME: &str = "Present";
+
+/// Vulkan presents to an X11 window through the `DRI3` and `Present`
+/// extensions. Proxy X servers used by remote-desktop products implement their
+/// own image transport and provide neither, yet the Vulkan driver probes for
+/// them over the same `xcb_connection_t` gpui reads events from. libxcb answers
+/// a request naming an extension it cannot resolve by shutting that connection
+/// down for good, which takes the event loop with it and leaves the process
+/// running without a window.
+///
+/// Dropping Vulkan when either extension is missing keeps those probes from
+/// ever running, so adapter selection reaches the OpenGL backend instead.
+/// Nothing usable is given up: without `DRI3` a hardware Vulkan driver cannot
+/// present to X11 at all, and a software one ranks below OpenGL in adapter
+/// selection anyway.
+fn supported_gpu_backends(xcb_connection: &XCBConnection) -> wgpu::Backends {
+    let backends = gpui_wgpu::default_backends();
+    let has_extension = |name: &'static str| {
+        xcb_connection
+            .extension_information(name)
+            .with_context(|| format!("Failed to query the X11 {name} extension"))
+            .log_err()
+            .flatten()
+            .is_some()
+    };
+
+    if has_extension(dri3::X11_EXTENSION_NAME) && has_extension(PRESENT_EXTENSION_NAME) {
+        backends
+    } else {
+        log::info!(
+            "x11: server does not implement DRI3 and Present, \
+             disabling the Vulkan backend"
+        );
+        backends.difference(wgpu::Backends::VULKAN)
+    }
 }
 
 fn detect_compositor_gpu(

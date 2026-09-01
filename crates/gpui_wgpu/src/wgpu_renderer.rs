@@ -210,6 +210,10 @@ pub struct WgpuRenderer {
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     compositor_gpu: Option<CompositorGpuHint>,
+    /// Backends the wgpu instance was built with, reused when the context is
+    /// rebuilt after device loss (unused on WASM).
+    #[allow(dead_code)]
+    backends: wgpu::Backends,
     resources: Option<WgpuResources>,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
@@ -261,6 +265,7 @@ impl WgpuRenderer {
         window: &W,
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
+        backends: wgpu::Backends,
     ) -> anyhow::Result<Self>
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
@@ -282,7 +287,7 @@ impl WgpuRenderer {
             .borrow()
             .as_ref()
             .map(|ctx| ctx.instance.clone())
-            .unwrap_or_else(|| WgpuContext::instance(Box::new(window.clone())));
+            .unwrap_or_else(|| WgpuContext::instance(Box::new(window.clone()), backends));
 
         // Safety: The caller guarantees that the window handle is valid for the
         // lifetime of this renderer. In practice, the RawWindow struct is created
@@ -310,6 +315,7 @@ impl WgpuRenderer {
             surface,
             config,
             compositor_gpu,
+            backends,
             atlas,
         )
     }
@@ -335,7 +341,15 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let atlas = Arc::new(WgpuAtlas::from_context(context));
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(
+            None,
+            context,
+            surface,
+            config,
+            None,
+            wgpu::Backends::empty(),
+            atlas,
+        )
     }
 
     fn new_internal(
@@ -344,6 +358,7 @@ impl WgpuRenderer {
         surface: wgpu::Surface<'static>,
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
+        backends: wgpu::Backends,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
@@ -583,6 +598,7 @@ impl WgpuRenderer {
         Ok(Self {
             context: gpu_context,
             compositor_gpu,
+            backends,
             resources: Some(resources),
             surface_config,
             atlas,
@@ -2086,16 +2102,25 @@ impl WgpuRenderer {
             self.resources = None;
             *gpu_context.borrow_mut() = None;
 
-            // Wait briefly for the GPU driver to stabilize, then try to
-            // recreate the context without software renderers. If this fails
-            // the caller should request another frame and retry — the real GPU
-            // may need more time to come back (e.g. after suspend/resume).
+            // Wait briefly for the GPU driver to stabilize, then recreate the
+            // context. If this fails the caller should request another frame
+            // and retry — the real GPU may need more time to come back (e.g.
+            // after suspend/resume).
             std::thread::sleep(std::time::Duration::from_millis(350));
 
-            let instance = WgpuContext::instance(Box::new(window.clone()));
+            let instance = WgpuContext::instance(Box::new(window.clone()), self.backends);
             let surface = create_surface(&instance, window_handle.as_raw())?;
-            let new_context =
-                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
+            // Software renderers are normally refused here so that recovery
+            // waits for a real GPU instead of silently replacing it. When the
+            // lost device was itself a software renderer there is nothing
+            // better to wait for, and refusing it would fail every retry
+            // forever — which is the only outcome on hosts that have no
+            // hardware renderer at all.
+            let new_context = if self.adapter_info.device_type == wgpu::DeviceType::Cpu {
+                WgpuContext::new(instance, &surface, self.compositor_gpu)?
+            } else {
+                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?
+            };
             *gpu_context.borrow_mut() = Some(new_context);
             surface
         } else {
@@ -2125,6 +2150,7 @@ impl WgpuRenderer {
             surface,
             config,
             self.compositor_gpu,
+            self.backends,
             self.atlas.clone(),
         )?;
 

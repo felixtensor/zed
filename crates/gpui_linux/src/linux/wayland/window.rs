@@ -574,7 +574,13 @@ impl WaylandWindowState {
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
-            WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+            WgpuRenderer::new(
+                gpu_context,
+                &raw_window,
+                config,
+                compositor_gpu,
+                gpui_wgpu::default_backends(),
+            )?
         };
 
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {

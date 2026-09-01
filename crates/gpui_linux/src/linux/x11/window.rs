@@ -9,7 +9,7 @@ use gpui::{
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -460,6 +460,7 @@ impl X11WindowState {
         parent_window: Option<X11WindowStatePtr>,
         supports_xinput_gestures: bool,
         is_bgr: bool,
+        gpu_backends: wgpu::Backends,
     ) -> anyhow::Result<Self> {
         // Native popups are not implemented on X11 yet. Rejecting lets callers fall back to
         // gpui's in-window popovers.
@@ -763,7 +764,13 @@ impl X11WindowState {
                     transparent: false,
                     preferred_present_mode: None,
                 };
-                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+                WgpuRenderer::new(
+                    gpu_context,
+                    &raw_window,
+                    config,
+                    compositor_gpu,
+                    gpu_backends,
+                )?
             };
 
             renderer.set_subpixel_layout(is_bgr);
@@ -928,6 +935,7 @@ impl X11Window {
         parent_window: Option<X11WindowStatePtr>,
         supports_xinput_gestures: bool,
         is_bgr: bool,
+        gpu_backends: wgpu::Backends,
     ) -> anyhow::Result<Self> {
         let ptr = X11WindowStatePtr {
             state: Rc::new(RefCell::new(X11WindowState::new(
@@ -947,6 +955,7 @@ impl X11Window {
                 parent_window,
                 supports_xinput_gestures,
                 is_bgr,
+                gpu_backends,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             xcb: xcb.clone(),

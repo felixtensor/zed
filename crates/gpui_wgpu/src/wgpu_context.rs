@@ -62,6 +62,14 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
+/// The backends gpui renders with on native platforms. Vulkan is preferred and
+/// OpenGL is the fallback; platform code narrows this set when the display
+/// server cannot support one of them.
+#[cfg(not(target_family = "wasm"))]
+pub fn default_backends() -> wgpu::Backends {
+    wgpu::Backends::VULKAN | wgpu::Backends::GL
+}
+
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
@@ -287,9 +295,12 @@ impl WgpuContext {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+    pub fn instance(
+        display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
+        backends: wgpu::Backends,
+    ) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
