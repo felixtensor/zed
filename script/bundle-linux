@@ -46,6 +46,12 @@ done
 export ZED_BUNDLE=true
 
 channel=$(<crates/zed/RELEASE_CHANNEL)
+# Set RELEASE_CHANNEL so crates/zed/build.rs embeds the matching app icon
+# as the X11 window icon; it defaults to the dev icon when this is unset.
+export RELEASE_CHANNEL="${channel}"
+# This build is not served by Zed's release infrastructure, so let it explain
+# itself rather than poll for updates that would replace it upstream.
+export ZED_UPDATE_EXPLANATION="${ZED_UPDATE_EXPLANATION:-This build was packaged in-house. Auto-updates are disabled; rebuild from the internal branch to update.}"
 target_dir="${CARGO_TARGET_DIR:-target}"
 
 version="$(script/get-crate-version zed)"
